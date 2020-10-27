@@ -603,5 +603,8 @@ update-images-go-version:
 	$(QUIET) $(MAKE) -C images update-golang-image
 	@echo "Updated go version in image Dockerfiles to $(GO_VERSION)"
 
-.PHONY: force generate-api generate-health-api install build-context-update clean-build clean clean-container veryclean
+dev-doctor:
+	$(QUIET)$(GO) run ./tools/dev-doctor
+
+.PHONY: force dev-doctor generate-api generate-health-api install build-context-update clean-build clean clean-container veryclean
 force :;
