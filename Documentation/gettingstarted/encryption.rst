@@ -7,7 +7,7 @@
 .. _encryption:
 
 ************************************
-Transparent Encryption (stable/beta)
+Transparent Encryption
 ************************************
 
 This guide explains how to configure Cilium to use IPsec based transparent
@@ -16,12 +16,6 @@ configuration is complete all traffic between Cilium-managed endpoints, as well
 as Cilium managed host traffic, will be encrypted using IPsec. This guide uses
 Kubernetes secrets to distribute keys. Alternatively, keys may be manually
 distributed, but that is not shown here.
-
-.. note::
-
-    The encryption feature is stable in combination with the direct-routing and
-    ENI datapath mode. In combination with encapsulation/tunneling, the feature
-    is still in beta phase.
 
 .. note::
 
