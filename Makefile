@@ -604,6 +604,7 @@ update-images-go-version:
 	@echo "Updated go version in image Dockerfiles to $(GO_VERSION)"
 
 dev-doctor:
+	$(QUIET)$(GO) version 2>/dev/null || ( echo "go not found, see https://golang.org/doc/install" ; false )
 	$(QUIET)$(GO) run ./tools/dev-doctor
 
 .PHONY: force dev-doctor generate-api generate-health-api install build-context-update clean-build clean clean-container veryclean
