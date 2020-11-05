@@ -16,6 +16,7 @@ package ctmap
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -36,6 +37,7 @@ import (
 	"github.com/cilium/cilium/pkg/tuple"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -103,6 +105,11 @@ type NatMap interface {
 	Open() error
 	Close() error
 	DeleteMapping(key tuple.TupleKey) error
+	DumpWithCallback(bpf.DumpCallback) error
+	DumpReliablyWithCallback(bpf.DumpCallback, *bpf.DumpStats) error
+	Delete(bpf.MapKey) error
+	DumpStats() *bpf.DumpStats
+	Lookup(bpf.MapKey) (bpf.MapValue, error)
 }
 
 type mapAttributes struct {
@@ -508,6 +515,108 @@ func GC(m *Map, filter *GCFilter) int {
 	}
 
 	return doGC(m, filter)
+}
+
+// PurgeOrphanNATEntries removes orphan SNAT entries. We call an SNAT entry
+// orphan if it does not have either a corresponding CT entry or an SNAT entry
+// in reverse order.
+//
+// The former case can happen when the CT entry is removed by the LRU eviction
+// which happens when the CT map becomes full. The latter case can happen for
+// the same LRU eviction reasons.
+//
+// PurgeOrphanNATEntries() is triggered by the datapath via the GC signaling
+// mechanism. When the datapath SNAT fails to find free mapping after
+// SNAT_SIGNAL_THRES attempts, it sends the signal via the perf ring buffer.
+// The consumer of the buffer invokes the function.
+//
+// The SNAT is being used for the following cases:
+// 1. By NodePort BPF on an intermediate node before fwd'ing request from outside
+//     to a destination node.
+// 2. A packet from local endpoint sent to outside (BPF-masq).
+// 3. A packet from a host local application (i.e. running in the host netns)
+//    This is needed to prevent SNAT from hijacking such connections.
+// 4. By DSR on a backend node to SNAT responses with service IP+port before
+//    sending to a client.
+//
+// In the case of 1-3, we always create a CT_EGRESS CT entry. This allows the
+// CT GC to remove corresponding SNAT entries. In the case of 4, will create
+// CT_INGRESS CT entry. See the unit test TestOrphanNatGC for more examples.
+//
+// The function only handles 1-3 cases, the 4. case is TODO(brb).
+func PurgeOrphanNATEntries(ctMap *Map) *NatGCStats {
+	if option.Config.NodePortMode == option.NodePortModeDSR ||
+		option.Config.NodePortMode == option.NodePortModeHybrid {
+		return nil
+	}
+
+	natMap := mapInfo[ctMap.mapType].natMap
+	if natMap == nil {
+		return nil
+	}
+	stats := newNatGCStats(natMap)
+
+	cb := func(key bpf.MapKey, value bpf.MapValue) {
+		natKey := key.(*nat.NatKey4)
+		natVal := value.(*nat.NatEntry4)
+
+		if natKey.GetFlags()&tuple.TUPLE_F_IN == 1 { // natKey is r(everse)tuple
+			ctKey := &tuple.TupleKey4Global{TupleKey4: tuple.TupleKey4{
+				// Workaround #5848
+				SourceAddr: natKey.SourceAddr,
+				DestPort:   natKey.SourcePort,
+				DestAddr:   natVal.Addr,
+				SourcePort: natVal.Port,
+				NextHeader: natKey.NextHeader,
+				Flags:      tuple.TUPLE_F_OUT,
+			}}
+			if _, err := ctMap.Lookup(ctKey); err != nil && errors.Is(err, unix.ENOENT) {
+				// No CT entry is found, so delete SNAT for both original and
+				// reverse flows
+				oNatKey := &nat.NatKey4{TupleKey4Global: tuple.TupleKey4Global{TupleKey4: tuple.TupleKey4{
+					SourceAddr: natVal.Addr,
+					SourcePort: natVal.Port,
+					DestAddr:   natKey.SourceAddr,
+					DestPort:   natKey.SourcePort,
+					NextHeader: natKey.NextHeader,
+					Flags:      tuple.TUPLE_F_OUT,
+				}}}
+				if err := natMap.Delete(natKey); err == nil {
+					stats.IngressDeleted += 1
+				}
+				if err := natMap.Delete(oNatKey); err == nil {
+					stats.EgressDeleted += 1
+				}
+			} else {
+				stats.IngressAlive += 1
+			}
+		} else { // natKey is o(riginal)tuple
+			// Check for reverse flow NAT entry. If not found, remove natKey.
+			// Note, that in the datapath otuple is inserted into the map after
+			// rtuple. This means that if we check first for rtuple and remove
+			// otuple, then there would be a race window during which to-be
+			// inserted NAT tuples by the datapath could be destroyed by the GC.
+			// In any case, such situation (rtuple exists, but otuple is evicted)
+			// will be eventually handled by the above branch (once the corresponding
+			// CT has been evicted) or by the CT GC.
+			rNatKey := &nat.NatKey4{TupleKey4Global: tuple.TupleKey4Global{TupleKey4: tuple.TupleKey4{
+				DestAddr:   natVal.Addr,
+				DestPort:   natVal.Port,
+				SourceAddr: natKey.DestAddr,
+				SourcePort: natKey.DestPort,
+				NextHeader: natKey.NextHeader,
+				Flags:      tuple.TUPLE_F_IN,
+			}}}
+			if _, err := natMap.Lookup(rNatKey); err != nil && errors.Is(err, unix.ENOENT) {
+				if err := natMap.Delete(natKey); err == nil {
+					stats.IngressDeleted += 1
+				}
+			}
+		}
+	}
+
+	natMap.DumpReliablyWithCallback(cb, stats.DumpStats)
+	return &stats
 }
 
 // Flush runs garbage collection for map m with the name mapType, deleting all
